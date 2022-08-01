@@ -1,0 +1,20 @@
+[package]
+name = "word-counter"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mikołaj Robakowski <mikolaj.rob@gmail.com>"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+axum = "0.5.13"
+clap = { version = "3.2.16", features = ["derive"] }
+dashmap = "5.3.4"
+futures = "0.3.21"
+serde = { version = "1.0.140", features = ["derive"] }
+serde_json = "1.0.82"
+tokio = { version = "1.20.1", features = ["full"] }
+tokio-stream = { version = "0.1.9", features = ["io-util"] }
+tower-http = { version = "0.3.4", features = ["trace"] }
+tracing = "0.1.36"
+tracing-subscriber = "0.3.15"
