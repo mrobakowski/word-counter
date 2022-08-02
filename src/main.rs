@@ -128,17 +128,17 @@ async fn process_loop_inner(
     window_size: usize,
     tx: watch::Sender<Response>,
 ) {
-    let mut blackbox_lines = BufReader::new(line_source).lines();
+    let mut line_source = BufReader::new(line_source).lines();
     let mut valid_message_window = VecDeque::with_capacity(window_size);
 
-    while let Some(line) = blackbox_lines.next_line().await.transpose() {
+    while let Some(line) = line_source.next_line().await.transpose() {
         let Ok(ref line) = line.map_err(|e| warn!("io error when reading line: {e}")) else { continue };
         trace!(line, "got line from the process");
 
-        let Ok(deserialized) = serde_json::from_str::<IncomingProcessData>(line)
+        let Ok(deserialized) = serde_json::from_str(line)
             .map_err(|e| warn!("deserialization error: {e}")) else { continue };
 
-        // NOTE: the order and -1 makes sure that we never go over the capacity so no reallocation
+        // NOTE: the order and -1 make sure that we never go over the capacity so no reallocation
         valid_message_window.truncate(window_size - 1);
         valid_message_window.push_front(count_words(deserialized));
 
