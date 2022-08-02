@@ -1,21 +1,20 @@
 #![feature(let_else)]
 
 use std::{
-    any::Any,
-    collections::{BTreeMap, VecDeque},
+    collections::{HashMap, VecDeque},
     error::Error,
     path::PathBuf,
     process::Stdio,
-    sync::Arc,
 };
 
 use axum::{routing::get, Json, Router, Server};
 use clap::Parser;
-use dashmap::DashMap;
+use inlinable_string::InlinableString as IString;
 use serde::Deserialize;
 use tokio::{
     io::{stdin, AsyncBufReadExt, AsyncRead, BufReader},
     process::Command,
+    sync::watch,
 };
 use tower_http::trace::TraceLayer;
 use tracing::{info, trace, warn};
@@ -26,14 +25,14 @@ struct IncomingProcessData<'s> {
     data: &'s str,
 }
 
-fn on_drop(f: impl FnMut() + 'static) -> impl Any {
-    struct OnDrop<F: FnMut() -> ()>(F);
-    impl<F: FnMut() -> ()> Drop for OnDrop<F> {
-        fn drop(&mut self) {
-            (self.0)()
-        }
+struct OnDrop<F: FnMut() -> ()>(F);
+impl<F: FnMut() -> ()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)()
     }
+}
 
+fn on_drop(f: impl FnMut()) -> OnDrop<impl FnMut()> {
     OnDrop(f)
 }
 
@@ -49,7 +48,7 @@ struct Args {
     window_size: usize,
 }
 
-type SharedState = Arc<DashMap<String, VecDeque<u64>>>;
+type Response = HashMap<IString, HashMap<IString, u64>>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -60,33 +59,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     tracing_subscriber::fmt::init();
 
-    // DashMap is a concurrent hash map, probably a bit of a premature optimization
-    let shared_state = Arc::new(DashMap::<String, VecDeque<u64>>::new());
+    let (tx, rx) = watch::channel(HashMap::new());
 
-    let process_listener_loop = tokio::spawn(process_loop(
-        exe_path,
-        window_size,
-        Arc::clone(&shared_state),
-    ));
+    let process_listener_loop = tokio::spawn(process_loop(exe_path, window_size, tx));
 
     let app = Router::new()
         .route(
-            "/count",
+            "/",
             get(|| async move {
-                Json(
-                    shared_state
-                        .iter()
-                        .map(|r| (r.key().clone(), r.value().iter().sum()))
-                        .collect::<BTreeMap<_, u64>>(),
-                )
+                // we could get rid of this .clone() by doing serialization in place instead of relying on the web framework
+                Json(rx.borrow().clone())
             }),
         )
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http()); // more pretty lights when you run with `RUST_LOG=trace`
 
     let server_loop = tokio::spawn(async move {
         let _guard = on_drop(|| info!("server loop ended"));
 
-        info!("The server is running at http://localhost:3000/count");
+        info!("The server is running at http://localhost:3000/");
 
         Server::bind(&"0.0.0.0:3000".parse().unwrap())
             .serve(app.into_make_service())
@@ -104,7 +94,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn process_loop(exe_path: Option<PathBuf>, window_size: usize, shared_state: SharedState) {
+async fn process_loop(exe_path: Option<PathBuf>, window_size: usize, tx: watch::Sender<Response>) {
     let _guard = on_drop(|| info!("process loop ended"));
 
     match exe_path {
@@ -123,12 +113,12 @@ async fn process_loop(exe_path: Option<PathBuf>, window_size: usize, shared_stat
                 .take()
                 .expect("child did not have a handle to stdout");
 
-            process_loop_inner(process_stdout, window_size, shared_state).await
+            process_loop_inner(process_stdout, window_size, tx).await
         }
 
         None => {
             info!("Exe not found, processing STDIN");
-            process_loop_inner(stdin(), window_size, shared_state).await
+            process_loop_inner(stdin(), window_size, tx).await
         }
     }
 }
@@ -136,9 +126,10 @@ async fn process_loop(exe_path: Option<PathBuf>, window_size: usize, shared_stat
 async fn process_loop_inner(
     line_source: impl AsyncRead + Unpin,
     window_size: usize,
-    shared_state: SharedState,
+    tx: watch::Sender<Response>,
 ) {
     let mut blackbox_lines = BufReader::new(line_source).lines();
+    let mut valid_message_window = VecDeque::with_capacity(window_size);
 
     while let Some(line) = blackbox_lines.next_line().await.transpose() {
         let Ok(ref line) = line.map_err(|e| warn!("io error when reading line: {e}")) else { continue };
@@ -147,14 +138,40 @@ async fn process_loop_inner(
         let Ok(deserialized) = serde_json::from_str::<IncomingProcessData>(line)
             .map_err(|e| warn!("deserialization error: {e}")) else { continue };
 
-        let word_count = deserialized.data.split_whitespace().count() as u64;
-
-        let mut window_buffer = shared_state
-            .entry(deserialized.event_type.into())
-            .or_insert_with(|| VecDeque::with_capacity(window_size));
-
         // NOTE: the order and -1 makes sure that we never go over the capacity so no reallocation
-        window_buffer.truncate(window_size - 1);
-        window_buffer.push_front(word_count);
+        valid_message_window.truncate(window_size - 1);
+        valid_message_window.push_front(count_words(deserialized));
+
+        match tx.send(sum_counts(&valid_message_window)) {
+            Ok(_) => (),
+            Err(_) => break, // channel closed
+        }
     }
+}
+
+// the data from the example processes provided is usually short words, so using strings optimized for short lengths makes sense here
+
+fn count_words(msg: IncomingProcessData) -> (IString, HashMap<IString, u64>) {
+    let mut counts = HashMap::new();
+
+    for word in msg.data.split_whitespace() {
+        *counts.entry(IString::from(word)).or_default() += 1;
+    }
+
+    (IString::from(msg.event_type), counts)
+}
+
+fn sum_counts<'c>(
+    data: impl IntoIterator<Item = &'c (IString, HashMap<IString, u64>)>,
+) -> Response {
+    let mut res = HashMap::new();
+
+    for (event_type, counts) in data {
+        let per_event_data: &mut HashMap<IString, u64> = res.entry(event_type.clone()).or_default();
+        for (word, count) in counts {
+            *per_event_data.entry(word.clone()).or_default() += *count;
+        }
+    }
+
+    res
 }
